@@ -9,8 +9,10 @@ import unittest
 
 if os.name == 'nt':
     sys.modules.setdefault('fcntl', types.ModuleType('fcntl'))
-spec = importlib.util.spec_from_file_location(
-    'lights', Path(__file__).with_name('v700-lights.py'))
+_mod_path = Path(__file__).with_name('v700-lights.py')
+if not _mod_path.exists():
+    _mod_path = Path(__file__).resolve().parent.parent / 'src' / 'v700-lights.py'
+spec = importlib.util.spec_from_file_location('lights', _mod_path)
 lights = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lights)
 

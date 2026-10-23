@@ -5,7 +5,8 @@ import unittest
 
 path = Path(__file__).with_name('honer-lights-gui-helper')
 if not path.exists():
-    path = Path('/usr/local/sbin/honer-lights-gui-helper')
+    repo_candidate = Path(__file__).resolve().parent.parent / 'src' / 'honer-lights-gui-helper'
+    path = repo_candidate if repo_candidate.exists() else Path('/usr/local/sbin/honer-lights-gui-helper')
 loader = importlib.machinery.SourceFileLoader('gui_helper', str(path))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 helper = importlib.util.module_from_spec(spec)
