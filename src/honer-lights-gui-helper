@@ -1,0 +1,308 @@
+#!/usr/bin/python3 -I
+"""Fixed and extended operations for the local lamp application, authorized by Polkit."""
+import argparse
+import contextlib
+import fcntl
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import time
+from types import SimpleNamespace
+
+ACTIONS = {
+    'status': (),
+    'all-on': (('logo', 'restore'), ('d0', 'restore')),
+    'all-off': (('logo', 'off'), ('d0', 'off')),
+    'logo-on': (('logo', 'restore'),),
+    'logo-off': (('logo', 'off'),),
+    'valley-on': (('d0', 'restore'),),
+    'valley-off': (('d0', 'off'),),
+}
+
+EXTENDED_ACTIONS = (
+    'kbd-on',
+    'kbd-off',
+    'kbd-zones',
+    'color',
+    'theme',
+    'effect',
+    'stop-effect',
+    'daemon-worker',
+)
+
+COMMAND_LOCK_PATH = Path('/run/lock/honer-v700-lights-command.lock')
+LAMP_LOCK_PATH = Path('/run/lock/honer-v700-lights.lock')
+DAEMON_PID_PATH = Path('/run/honer-v700-lights-daemon.pid')
+DAEMON_STATE_PATH = Path('/run/honer-v700-lights-effect.json')
+
+
+def load_lights_module():
+    spec = importlib.util.spec_from_file_location(
+        'v700_lights', '/usr/local/lib/honer-v700-lights/v700-lights.py')
+    lights = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lights)
+    return lights
+
+
+def summarize(items, zone):
+    expected = {'logo': 1, 'b0': 4, 'd0': 70}[zone]
+    if len(items) != expected:
+        raise ValueError('Incomplete lamp status')
+    lit = 0
+    for selector, item in enumerate(items):
+        reply = bytes.fromhex(item['reply'])
+        region = {'logo': 0xA0, 'b0': 0xB0, 'd0': 0xD0}[zone]
+        if (item['zone'] != zone or item['selector'] != selector
+                or len(reply) != 256 or reply[:4] != bytes([0, region, 0, selector])
+                or reply[6] != 1):
+            raise ValueError('Invalid lamp status')
+        lit += int(any(reply[7:10]))
+    return {'state': 'off' if lit == 0 else 'on' if lit == expected else 'mixed',
+            'lit': lit, 'total': expected}
+
+
+def extract_colors(logo_items, d0_items, d0_blocks, b0_items=None):
+    logo_hex = '#000000'
+    if logo_items:
+        rgb = bytes.fromhex(logo_items[0]['reply'])[7:10]
+        logo_hex = '#' + rgb.hex()
+    valley_hexes = []
+    if len(d0_items) == 70:
+        for start, _end in d0_blocks:
+            rgb = bytes.fromhex(d0_items[start]['reply'])[7:10]
+            valley_hexes.append('#' + rgb.hex())
+    else:
+        valley_hexes = ['#000000'] * len(d0_blocks)
+    kbd_hexes = ['#000000'] * 4
+    if b0_items and len(b0_items) == 4:
+        kbd_hexes = ['#' + bytes.fromhex(item['reply'])[7:10].hex() for item in b0_items]
+    return {'logo': logo_hex, 'valley': valley_hexes, 'keyboard': kbd_hexes}
+
+
+def get_active_effect():
+    if not DAEMON_PID_PATH.exists():
+        return None
+    try:
+        pid = int(DAEMON_PID_PATH.read_text().strip())
+        os.kill(pid, 0)
+    except (ValueError, OSError):
+        DAEMON_PID_PATH.unlink(missing_ok=True)
+        DAEMON_STATE_PATH.unlink(missing_ok=True)
+        return None
+    if DAEMON_STATE_PATH.exists():
+        try:
+            data = json.loads(DAEMON_STATE_PATH.read_text())
+            data['pid'] = pid
+            return data
+        except Exception:
+            pass
+    return {'name': 'unknown', 'pid': pid}
+
+
+def stop_effect_daemon():
+    if not DAEMON_PID_PATH.exists():
+        DAEMON_STATE_PATH.unlink(missing_ok=True)
+        return False
+    try:
+        pid = int(DAEMON_PID_PATH.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(40):
+            time.sleep(0.05)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except (ValueError, OSError):
+        pass
+    finally:
+        DAEMON_PID_PATH.unlink(missing_ok=True)
+        DAEMON_STATE_PATH.unlink(missing_ok=True)
+    return True
+
+
+def execute(action, extra=None):
+    if os.geteuid() != 0:
+        raise PermissionError('Administrator authorization required')
+    lights = load_lights_module()
+    result = {'ok': True}
+    with open(COMMAND_LOCK_PATH, 'w') as command_lock:
+        fcntl.flock(command_lock, fcntl.LOCK_EX)
+
+        if action != 'status':
+            stop_effect_daemon()
+
+        subprocess.run(['/usr/sbin/modprobe', 'honer_v700_lights'],
+                       check=True, capture_output=True, text=True)
+        keep_module_loaded = False
+        try:
+            try:
+                if action in ACTIONS:
+                    ops = list(ACTIONS[action])
+                    if action == 'all-on' and lights.backup_path('b0').exists():
+                        ops.append(('b0', 'restore'))
+                    elif action == 'all-off' and lights.backup_path('b0').exists():
+                        ops.append(('b0', 'off'))
+
+                    for zone, _operation in ops:
+                        lights.validated_backup(zone)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        for zone, operation in ops:
+                            lights.run(SimpleNamespace(action=operation, zone=zone))
+                            if operation == 'restore':
+                                actual = lights.capture(zone)
+                                original = lights.validated_backup(zone)
+                                if any(bytes.fromhex(a['reply'])[1:10] != bytes.fromhex(b['reply'])[1:10]
+                                       for a, b in zip(actual, original)):
+                                    raise RuntimeError('Restored lamp state did not read back correctly')
+
+                elif action in ('kbd-on', 'kbd-off'):
+                    op = 'restore' if action == 'kbd-on' else 'off'
+                    lights.validated_backup('b0')
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        lights.run(SimpleNamespace(action=op, zone='b0'))
+
+                elif action == 'kbd-zones':
+                    parts = [p.strip() for p in extra.zones_hex.split(',') if p.strip()]
+                    if len(parts) != 4:
+                        raise ValueError('Expected 4 comma-separated hex colors for keyboard zones')
+                    zone_rgbs = [lights.parse_hex_color(p, extra.brightness) for p in parts]
+                    lights.apply_packets_locked(lights.kbd_zone_requests(zone_rgbs))
+
+                elif action == 'color':
+                    rgb = lights.parse_hex_color(extra.hex, extra.brightness)
+                    packets = []
+                    if extra.target in ('all', 'logo'):
+                        packets.extend(lights.color_requests('logo', rgb))
+                    if extra.target in ('all', 'keyboard'):
+                        packets.extend(lights.color_requests('b0', rgb))
+                    if extra.target in ('all', 'valley'):
+                        packets.extend(lights.color_requests('d0', rgb))
+                    lights.apply_packets_locked(packets)
+
+                elif action == 'theme':
+                    packets = lights.theme_requests(extra.name, brightness=extra.brightness, include_kbd=True)
+                    lights.apply_packets_locked(packets)
+
+                elif action == 'effect':
+                    if extra.name not in lights.DYNAMIC_EFFECTS:
+                        raise ValueError('Unknown dynamic effect: ' + str(extra.name))
+                    lights.parse_hex_color(extra.hex, extra.brightness)
+                    proc = subprocess.Popen(
+                        [
+                            '/usr/bin/python3', '-I',
+                            '/usr/local/sbin/honer-lights-gui-helper',
+                            'daemon-worker',
+                            '--name', extra.name,
+                            '--hex', extra.hex,
+                            '--speed', extra.speed,
+                            '--brightness', str(extra.brightness),
+                            '--target', extra.target,
+                        ],
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    DAEMON_PID_PATH.write_text(str(proc.pid) + '\n')
+                    state_info = {
+                        'name': extra.name,
+                        'label': lights.DYNAMIC_EFFECTS[extra.name],
+                        'hex': '#' + extra.hex.strip().lstrip('#').lower(),
+                        'speed': extra.speed,
+                        'brightness': extra.brightness,
+                        'target': extra.target,
+                    }
+                    DAEMON_STATE_PATH.write_text(json.dumps(state_info, ensure_ascii=False))
+                    keep_module_loaded = True
+                    time.sleep(0.16)
+
+                elif action == 'stop-effect':
+                    pass
+
+            except Exception as exc:
+                result.update(ok=False, error=str(exc))
+
+            active_effect = get_active_effect()
+            if active_effect:
+                keep_module_loaded = True
+            result['active_effect'] = active_effect
+
+            try:
+                with open(LAMP_LOCK_PATH, 'w') as lamp_lock:
+                    fcntl.flock(lamp_lock, fcntl.LOCK_EX)
+                    logo_snap = lights.capture('logo')
+                    b0_snap = lights.capture('b0')
+                    d0_snap = lights.capture('d0')
+                    result['lights'] = {
+                        'logo': summarize(logo_snap, 'logo'),
+                        'keyboard': summarize(b0_snap, 'b0'),
+                        'valley': summarize(d0_snap, 'd0'),
+                    }
+                    result['colors'] = extract_colors(logo_snap, d0_snap, lights.D0_BLOCKS, b0_snap)
+            except Exception as exc:
+                result.update(ok=False, error=str(exc))
+        finally:
+            if not keep_module_loaded:
+                unloaded = subprocess.run(
+                    ['/usr/sbin/modprobe', '-r', 'honer_v700_lights'],
+                    capture_output=True, text=True)
+                if unloaded.returncode:
+                    result.update(ok=False, error='Unable to release the lighting module')
+    result['boot_off'] = subprocess.run(
+        ['/usr/bin/systemctl', 'is-enabled', '--quiet', 'honer-v700-lights.service'],
+        capture_output=True).returncode == 0
+    return result
+
+
+def run_daemon_worker(args):
+    lights = load_lights_module()
+    rgb = lights.parse_hex_color(args.hex, 100)
+    try:
+        lights.run_effect_loop(
+            effect_name=args.name,
+            base_rgb=rgb,
+            speed=args.speed,
+            brightness=args.brightness,
+            target=args.target,
+        )
+    finally:
+        if DAEMON_PID_PATH.exists():
+            try:
+                if int(DAEMON_PID_PATH.read_text().strip()) == os.getpid():
+                    DAEMON_PID_PATH.unlink(missing_ok=True)
+                    DAEMON_STATE_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('action', choices=tuple(ACTIONS) + EXTENDED_ACTIONS)
+    parser.add_argument('--name', default='ice-blue')
+    parser.add_argument('--hex', default='00aaff')
+    parser.add_argument('--zones-hex', default='00aaff,00ff00,ffff00,ff2424')
+    parser.add_argument('--target', choices=('all', 'logo', 'keyboard', 'valley'), default='all')
+    parser.add_argument('--speed', choices=('slow', 'normal', 'fast'), default='normal')
+    parser.add_argument('--brightness', type=int, default=100)
+    args = parser.parse_args()
+
+    if args.action == 'daemon-worker':
+        return run_daemon_worker(args)
+
+    try:
+        result = execute(args.action, extra=args)
+    except Exception as exc:
+        result = {'ok': False, 'error': str(exc)}
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result['ok'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

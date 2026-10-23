@@ -1,0 +1,14 @@
+[Unit]
+Description=Turn off HONOR Hunter V700 logo and wind valley lighting
+After=systemd-modules-load.service
+ConditionPathExists=/var/lib/honer-v700-lights/original-lighting.json
+ConditionPathExists=/var/lib/honer-v700-lights/original-lighting-d0.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/honer-lights off
+RemainAfterExit=yes
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

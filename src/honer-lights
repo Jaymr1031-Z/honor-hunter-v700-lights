@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+    off|restore|status)
+        action=$1
+        if [ "$(id -u)" -ne 0 ]; then
+            echo 'Run with sudo' >&2
+            exit 1
+        fi
+        if [ "$action" != "status" ]; then
+            /usr/local/sbin/honer-lights-gui-helper stop-effect >/dev/null 2>&1 || true
+        fi
+        exec 9>/run/lock/honer-v700-lights-command.lock
+        flock -x 9
+        modprobe honer_v700_lights
+        trap 'modprobe -r honer_v700_lights 2>/dev/null || true' EXIT
+        for zone in logo d0; do
+            /usr/bin/python3 /usr/local/lib/honer-v700-lights/v700-lights.py "$action" --zone "$zone"
+        done
+        ;;
+    color|theme|effect|stop-effect|all-on|all-off|logo-on|logo-off|kbd-on|kbd-off|kbd-zones|valley-on|valley-off)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo 'Run with sudo' >&2
+            exit 1
+        fi
+        exec /usr/local/sbin/honer-lights-gui-helper "$@"
+        ;;
+    *)
+        echo 'Usage: sudo honer-lights {off|restore|status|color|theme|effect|stop-effect|kbd-on|kbd-off|kbd-zones}' >&2
+        exit 2
+        ;;
+esac

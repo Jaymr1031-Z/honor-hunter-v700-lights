@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=灯光控制
+Comment=控制荣耀猎人 LOGO 和风谷灯
+Exec=/usr/bin/python3 -I /usr/local/lib/honer-v700-lights/light-control-app.py
+Icon=night-light-symbolic
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+DBusActivatable=false

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Honer Light Control</vendor>
+  <action id="local.honer.lights.control">
+    <description>Control Honor Hunter lighting</description>
+    <description xml:lang="zh_CN">控制荣耀猎人灯光</description>
+    <message>Authentication is required to control the laptop lighting.</message>
+    <message xml:lang="zh_CN">请输入管理员密码以读取或控制笔记本灯光。</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/honer-lights-gui-helper</annotate>
+  </action>
+</policyconfig>
